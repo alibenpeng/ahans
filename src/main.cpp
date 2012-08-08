@@ -20,14 +20,10 @@
 
 #include "config.h"
 
-<<<<<<< HEAD
 #define GET             0
 #define POST            1
 
 
-=======
-
->>>>>>> c3b7a1e7f58601fb4559db8673dcf4719e5c6b2e
 int serial_fd; /* File descriptor for the serial port */
 int msgid = 0;
 char answer_strings[MAX_ANSWERSTRINGS][MAX_ANSWERSTRING_LENGTH];
@@ -152,7 +148,6 @@ int curl_helper(char *buf) {
 		strcpy(curl_args.method, "GET");
 		//curl_args.data = "";
 	}
-<<<<<<< HEAD
 
 /*
 	t_error = pthread_create(&tid[0], NULL, curl_rest, &curl_args);
@@ -318,184 +313,6 @@ int answer_to_connection (void *cls, struct MHD_Connection *connection,
 				return MHD_NO;
 			}
 
-=======
-
-/*
-	t_error = pthread_create(&tid[0], NULL, curl_rest, &curl_args);
-	if (0 != t_error) {
-		fprintf(stderr, "Couldn't run thread number %d, errno %d\n", 0, t_error);
-	} else {
-		pthread_detach(tid[0]);
-	}
-*/
-	curl_rest(&curl_args);
-	//free(curl_args);
-	return(0) ;
-}
-
-
-char *send_serial_cmd (struct MHD_Connection *connection, const char *cmd_string) {
-
-	int response_timeout = 1000; // in milliseconds!
-	int rcvd_msgid;
-	char serial_string[256];
-	char serial_answer[256];
-
-	int sstring_size = snprintf(serial_string, 256, "MSG ID: 0x%04x: %s\n", ++msgid, cmd_string);
-
-	// Send string to serial port and wait for response!
-	printf("send_serial_cmd(): sending %s (size: %d) to the serial port\n", serial_string, sstring_size);
-	write(serial_fd, serial_string, sstring_size);
-
-	printf("send_serial_cmd(): waiting for answer from AVR\n");
-	while (response_timeout >= 0) {
-		// search in answer_strings array for msgid
-		for (int i = 0 ; i <= (MAX_ANSWERSTRINGS -1) ; i++) {
-			if (sscanf(answer_strings[i], "MSG ID: 0x%x: %s", &rcvd_msgid, serial_answer) == 2) {
-				//printf("send_serial_cmd(): Found string: %s\n", answer_strings[i]);
-				// array elemt with msgid found - check if it is the msgid we are looking for!
-				if (rcvd_msgid == msgid) {
-					// we found the right msgid
-					printf("send_serial_cmd(): Found MSG ID: %d\n", msgid);
-					return(answer_strings[i]);
-				}
-			}
-		}
-		response_timeout--;
-		usleep(1000);
-	}
-	printf("send_serial_cmd(): No answer from AVR - sending error page\n");
-	return (char *) "ERROR";
-}
-
-
-
-
-int send_page (struct MHD_Connection *connection, const char *page) {
-  int ret;
-  struct MHD_Response *response;
-
-
-  response = MHD_create_response_from_data (strlen (page), (void *) page, MHD_NO, MHD_NO);
-  if (!response)
-    return MHD_NO;
-
-		printf("Queueing %s\n", page);
-  ret = MHD_queue_response (connection, MHD_HTTP_OK, response);
-  MHD_destroy_response (response);
-
-  return ret;
-}
-
-
-
-int process_get_request (struct MHD_Connection *connection, const char *url, void *coninfo_cls) {
-
-	//int item_group, item_id = 0;
-	//char item_name, item_request[32];
-	struct connection_info_struct *con_info = (struct connection_info_struct *) coninfo_cls;
-
-	//if (sscanf(url, "/%s/%d/%d/%s", &item_name, &item_group, &item_id, &item_request) == 4) {
-	//	printf("Processing HTTP GET Request: Item: %s, Group: %d, ID: %d, Command: %s\n", item_name, item_group, item_id, item_request);
-	//}
-	char *data = send_serial_cmd(connection, url);
-	int size = 1;
-	if ((size > 0) && (size <= MAXNAMESIZE)) {
-		char *answerstring;
-		answerstring = (char*) malloc (MAXANSWERSIZE);
-		if (!answerstring) return MHD_NO;
-
-		snprintf (answerstring, MAXANSWERSIZE, answerpage, data);
-		con_info->answerstring = answerstring;
-		printf("Returning %s\n", con_info->answerstring);
-		//free(answerstring);
-		return MHD_NO;
-	}
-	return MHD_YES;
-}
-
-
-int
-iterate_post (void *coninfo_cls, enum MHD_ValueKind kind, const char *key,
-              const char *filename, const char *content_type,
-              const char *transfer_encoding, const char *data, uint64_t off,
-              size_t size)
-{
-  //struct connection_info_struct *con_info = (struct connection_info_struct *) coninfo_cls;
-
-
-  if ((0 == strncmp (key, "ON", 3)) || (0 == strncmp (key, "OFF", 3))) {
-
-// print command to serial port and return!
-
-/*
-      if ((size > 0) && (size <= MAXNAMESIZE))
-        {
-          char *answerstring;
-          answerstring = (char*) malloc (MAXANSWERSIZE);
-          if (!answerstring)
-            return MHD_NO;
-
-          snprintf (answerstring, MAXANSWERSIZE, answerpage, data);
-          con_info->answerstring = answerstring;
-        }
-      else
-        con_info->answerstring = NULL;
-
-*/
-      return MHD_NO;
-    }
-
-  return MHD_YES;
-}
-
-void
-request_completed (void *cls, struct MHD_Connection *connection,
-                   void **con_cls, enum MHD_RequestTerminationCode toe)
-{
-  struct connection_info_struct *con_info =
-    (struct connection_info_struct *) *con_cls;
-
-
-  if (NULL == con_info)
-    return;
-
-  if (con_info->connectiontype == POST)
-    {
-      MHD_destroy_post_processor (con_info->postprocessor);
-      if (con_info->answerstring)
-        free (con_info->answerstring);
-    }
-
-  free (con_info);
-  *con_cls = NULL;
-}
-
-
-int answer_to_connection (void *cls, struct MHD_Connection *connection,
-                      const char *url, const char *method,
-                      const char *version, const char *upload_data,
-                      size_t *upload_data_size, void **con_cls) {
-
-	if (NULL == *con_cls) {
-		printf("answer_to_connection(): *con_cls == NULL\n");
-		struct connection_info_struct *con_info;
-
-		con_info = (connection_info_struct*) malloc (sizeof (struct connection_info_struct));
-
-		if (NULL == con_info) return MHD_NO;
-
-		con_info->answerstring = NULL;
-
-		if (0 == strncmp (method, "POST", 4)) {
-			con_info->postprocessor = MHD_create_post_processor (connection, POSTBUFFERSIZE, iterate_post, (void *) con_info);
-
-			if (NULL == con_info->postprocessor) {
-				free (con_info);
-				return MHD_NO;
-			}
-
->>>>>>> c3b7a1e7f58601fb4559db8673dcf4719e5c6b2e
 			con_info->connectiontype = POST;
 		} else {
 			con_info->connectiontype = GET;
