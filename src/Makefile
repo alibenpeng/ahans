@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -g
+CFLAGS = -Wall -g -I$(STAGING_DIR)/usr/include
 LDFLAGS += -L$(STAGING_DIR)/root-brcm47xx/usr/lib -lcurl -lpthread -lmicrohttpd -lstdc++
 OBJS = main.o
 

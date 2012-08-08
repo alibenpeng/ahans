@@ -10,22 +10,20 @@
 #include <termios.h> /* POSIX terminal control definitions */
 #include <pthread.h>
 #include <sys/types.h> 
+#include <sys/stat.h> 
 #include <sys/select.h>
-#include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <curl/curl.h>
 #include <microhttpd.h>
 
-#define BAUDRATE B57600
 #define SERIAL_PORT "/dev/ttyS1"
+#define BAUDRATE B57600
 
 #define POWER_LED_FILE "/proc/diag/led/power"
 
 #define HTTPD_PORT 8888
-#define TCP_PORT 4223
-
-#define FALSE 0
-#define TRUE 1
+#define HTTPD_ROOT "/www/ahans"
 
 #define NUM_COUNTERS 5
 #define NUM_INSTALLED_COUNTERS 3
@@ -34,34 +32,64 @@
 #define COUNTER3 2
 #define COUNTER4 3
 #define COUNTER5 4
-#define COUNTER1_URL "http://lardass/middleware.php/data/46b27ba0-6ae1-11e1-91d0-4315961506a9.json?operation=add&value=%d"
-#define COUNTER2_URL "http://lardass/middleware.php/data/60435230-6ae1-11e1-bc8b-7f8bbcdebe7a.json?operation=add&value=%d"
-#define COUNTER3_URL "http://lardass/middleware.php/data/65c072e0-6ae1-11e1-879a-7bc14050b5a0.json?operation=add&value=%d"
+#define COUNTER1_URL "http://yavdr:81/middleware.php/data/46b27ba0-6ae1-11e1-91d0-4315961506a9.json?operation=add&value=%d"
+#define COUNTER2_URL "http://yavdr:81/middleware.php/data/60435230-6ae1-11e1-bc8b-7f8bbcdebe7a.json?operation=add&value=%d"
+#define COUNTER3_URL "http://yavdr:81/middleware.php/data/65c072e0-6ae1-11e1-879a-7bc14050b5a0.json?operation=add&value=%d"
 
-volatile int STOP=FALSE; 
+#define MAX_STRINGS 10
+#define FALSE 0
+#define TRUE 1
 
-char empty_page[65535];
-char *page = empty_page;
+typedef struct {
+	char url[256];
+	char data[256];
+} put_args_t;
 
-int serial_fd; /* File descriptor for the port */
-char serial_buffer[256];
-char *bufptr;
-int nbytes;
+int msgid;
+int avr_failure;
 
-int sockfd, newsockfd, portno;
+int num_strings;
+char serial_strings[MAX_STRINGS][256];
+
+static char empty_page[65535];
+static char *page = empty_page;
+bool page_delivered = 1;
+
+int waiting_for_response;
+
+int serial_fd; /* File descriptor for the serial port */
 
 void error(const char *msg) {
     perror(msg);
     exit(1);
 }
 
+char *timestamp() {
+	time_t ltime;
+	struct tm *Tm;
+	static char ts[22];
+ 
+	ltime=time(NULL);
+	Tm=localtime(&ltime);
+
+	sprintf(ts, "%04d-%02d-%02dT%02d:%02d:%02d",
+									Tm->tm_year + 1900,
+									Tm->tm_mon,
+									Tm->tm_mday,
+									Tm->tm_hour,
+									Tm->tm_min,
+									Tm->tm_sec);
+	return (char *)ts;
+}
  
 // Define the function to be called when ctrl-c (SIGINT) signal is sent to process
 void signal_callback_handler(int signum) {
 	printf("Caught signal %d\n",signum);
 
+/*
 	struct MHD_Daemon *daemon;
 	MHD_stop_daemon (daemon);
+*/
 
 	// Terminate program
 	exit(signum);
@@ -74,87 +102,39 @@ void kill_power_led() {
 	fclose(fp);
 }
 
-int open_serial_port() {
-		int c, res;
-		struct termios oldtio,newtio;
-		char buf[255];
-/* 
-		Open modem device for reading and writing and not as controlling tty
-		because we don't want to get killed if linenoise sends CTRL-C.
-*/
-	serial_fd = open(SERIAL_PORT, O_RDWR | O_NOCTTY ); 
-	if (serial_fd <0) {perror(SERIAL_PORT); exit(-1); }
+void *put_rest_data(void *data) {
+	CURL *curl;
+	CURLcode res;
+	FILE *devnull;
+	put_args_t put_args;
+	put_args = *(put_args_t*)  data;
 
-	tcgetattr(serial_fd,&oldtio); /* save current serial port settings */
-	bzero(&newtio, sizeof(newtio)); /* clear struct for new port settings */
+	printf("PUTting Data %s to URL %s\n", put_args.data, put_args.url);
+	
+	//printf("GET_URL: Getting URL: %s\n", url);
+	curl = curl_easy_init();
+	if(curl) {
+		devnull = fopen("/dev/null", "w");
 
-/* 
-		BAUDRATE: Set bps rate. You could also use cfsetispeed and cfsetospeed.
-		CRTSCTS : output hardware flow control (only used if the cable has
-												all necessary lines. See sect. 7 of Serial-HOWTO)
-		CS8     : 8n1 (8bit,no parity,1 stopbit)
-		CLOCAL  : local connection, no modem contol
-		CREAD   : enable receiving characters
-*/
-	newtio.c_cflag = BAUDRATE | HUPCL | CS8 | CLOCAL | CREAD;
-	
-/*
-		IGNPAR  : ignore bytes with parity errors
-		ICRNL   : map CR to NL (otherwise a CR input on the other computer
-												will not terminate input)
-		otherwise make device raw (no other input processing)
-*/
-	newtio.c_iflag &= ~( ICRNL | IGNPAR );
-	
-/*
-	Raw output.
-*/
-	newtio.c_oflag = 0;
-	
-/*
-		ICANON  : enable canonical input
-		disable all echo functionality, and don't send signals to calling program
-*/
-	newtio.c_lflag &= ~( ICANON );
-	
-/* 
-		initialize all control characters 
-		default values can be found in /usr/include/termios.h, and are given
-		in the comments, but we don't need them here
-*/
-	newtio.c_cc[VINTR]    = 0;     /* Ctrl-c */ 
-	newtio.c_cc[VQUIT]    = 0;     /* Ctrl-\ */
-	newtio.c_cc[VERASE]   = 0;     /* del */
-	newtio.c_cc[VKILL]    = 0;     /* @ */
-	newtio.c_cc[VEOF]     = 4;     /* Ctrl-d */
-	newtio.c_cc[VTIME]    = 0;     /* inter-character timer unused */
-	newtio.c_cc[VMIN]     = 1;     /* blocking read until 1 character arrives */
-	newtio.c_cc[VSWTC]    = 0;     /* '\0' */
-	newtio.c_cc[VSTART]   = 0;     /* Ctrl-q */ 
-	newtio.c_cc[VSTOP]    = 0;     /* Ctrl-s */
-	newtio.c_cc[VSUSP]    = 0;     /* Ctrl-z */
-	newtio.c_cc[VEOL]     = 0;     /* '\0' */
-	newtio.c_cc[VREPRINT] = 0;     /* Ctrl-r */
-	newtio.c_cc[VDISCARD] = 0;     /* Ctrl-u */
-	newtio.c_cc[VWERASE]  = 0;     /* Ctrl-w */
-	newtio.c_cc[VLNEXT]   = 0;     /* Ctrl-v */
-	newtio.c_cc[VEOL2]    = 0;     /* '\0' */
+		struct curl_slist *headers=NULL;
+		headers = curl_slist_append(headers, "Content-Type: text/plain");
 
-/* 
-		now clean the modem line and activate the settings for the port
-*/
-	tcflush(serial_fd, TCIFLUSH);
-	tcsetattr(serial_fd,TCSANOW,&newtio);
+		curl_easy_setopt(curl, CURLOPT_URL, put_args.url);
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, devnull);
+		//curl_easy_setopt(curl, CURLOPT_RETURNTRANSFER, TRUE);
+		curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+		curl_easy_setopt(curl, CURLOPT_USERAGENT, "Alis Home Automation Network Server v0.1");
+		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, put_args.data);
+		res = curl_easy_perform(curl);
 
-/*
-		terminal settings done, now handle input
-		In this example, inputting a 'z' at the beginning of a line will 
-		exit the program.
-*/
-	/* restore the old port settings */
-	//tcsetattr(serial_fd,TCSANOW,&oldtio);
+		fclose(devnull);
+		/* always cleanup */ 
+		curl_easy_cleanup(curl);
+		return NULL;
+	}
+	return 0;
 }
-
 
 
 void *get_url(void *url) {
@@ -163,6 +143,7 @@ void *get_url(void *url) {
 	FILE *devnull;
 
 	
+	//printf("GET_URL: Getting URL: %s\n", url);
 	curl = curl_easy_init();
 	if(curl) {
 		devnull = fopen("/dev/null", "w");
@@ -180,16 +161,17 @@ void *get_url(void *url) {
 	return 0;
 }
 
-int powermeter() {
+int powermeter(char *buffer) {
 	pthread_t tid[NUM_INSTALLED_COUNTERS];
 	int t_error;
 	int counter[NUM_COUNTERS];
 	uint32_t duration[NUM_COUNTERS];
-	char urls[NUM_INSTALLED_COUNTERS][255];
-	int rf12_hdr;
+	static char urls[NUM_INSTALLED_COUNTERS][256];
+	int rf12_node_id;
 	int rf12_seq;
 
-	if (sscanf(serial_buffer, "hdr: 0x%x, seq: %d, data = %d %d %d %d %d %d %d %d %d %d", &rf12_hdr, &rf12_seq, &counter[COUNTER1], &duration[COUNTER1], &counter[COUNTER2], &duration[COUNTER2], &counter[COUNTER3], &duration[COUNTER3], &counter[COUNTER4], &duration[COUNTER4], &counter[COUNTER5], &duration[COUNTER5]) == 12) {
+	//printf("POWERMETER: %s\n", buffer);
+	if (sscanf(buffer, "Node ID: %d, seq: %d, data = %d %d %d %d %d %d %d %d %d %d", &rf12_node_id, &rf12_seq, &counter[COUNTER1], &duration[COUNTER1], &counter[COUNTER2], &duration[COUNTER2], &counter[COUNTER3], &duration[COUNTER3], &counter[COUNTER4], &duration[COUNTER4], &counter[COUNTER5], &duration[COUNTER5]) == 12) {
 
 #ifdef COUNTER1_URL
 		sprintf(urls[0], COUNTER1_URL, counter[COUNTER1]);
@@ -201,37 +183,57 @@ int powermeter() {
 		sprintf(urls[2], COUNTER3_URL, counter[COUNTER3]);
 #endif
 #ifdef COUNTER4_URL
-		sprintf(urls[3], COUNTER3_URL, counter[COUNTER4]);
+		sprintf(urls[3], COUNTER4_URL, counter[COUNTER4]);
 #endif
 #ifdef COUNTER5_URL
-		sprintf(urls[4], COUNTER3_URL, counter[COUNTER5]);
+		sprintf(urls[4], COUNTER5_URL, counter[COUNTER5]);
 #endif
 
 		for (int i = 0 ; i < NUM_INSTALLED_COUNTERS ; i++) {
+			//printf("POWERMETER: Getting URL: %s\n", urls[i]);
+			//get_url(urls[1]);
 			t_error = pthread_create(&tid[i], NULL, get_url, (void *)urls[i]);
 			if (0 != t_error) {
 				fprintf(stderr, "Couldn't run thread number %d, errno %d\n", i, t_error);
 			} else {
-				//fprintf(stderr, "Thread %d, gets %s\n", i, urls[i]);
 				pthread_detach(tid[i]);
 			}
+/*
+*/
 		}
 	}
 	return(0);
 }
 
-int thermometer() {
-	pthread_t tid[1];
+int thermometer(char *buffer) {
+	pthread_t tid[2];
 	int t_error;
 	float tC;
 	int t_awake;
-	char url[255];
-	int rf12_hdr;
+	//static char urls[2][256];
+	static char url[256];
+	int rf12_node_id;
 	int rf12_seq;
+	static put_args_t put_args;
 
-	if (sscanf(serial_buffer, "hdr: 0x%x, seq: %d, data = %f degrees C, awake: %dms", &rf12_hdr, &rf12_seq, &tC, &t_awake) == 4) {
-		sprintf(url, "http://lardass/middleware.php/data/8fa9d0f0-6af2-11e1-a30d-f73d9a35e2de.json?operation=add&value=%.2f", tC);
+	if (sscanf(buffer, "Node ID: %d, seq: %d, data = %f degrees C, awake: %dms", &rf12_node_id, &rf12_seq, &tC, &t_awake) == 4) {
+		sprintf(url, "http://yavdr:81/middleware.php/data/8fa9d0f0-6af2-11e1-a30d-f73d9a35e2de.json?operation=add&value=%.2f", tC);
+		sprintf(put_args.url, "http://yavdr:8081/rest/items/Temperature_FF_Office/state");
+		sprintf(put_args.data, "%.2f", tC);
 
+/*
+		sprintf(urls[0], "http://yavdr:81/middleware.php/data/8fa9d0f0-6af2-11e1-a30d-f73d9a35e2de.json?operation=add&value=%.2f", tC);
+		sprintf(urls[1], "http://yavdr:8081/", counter[COUNTER5]);
+
+		for (int i = 0 ; i < 2 ; i++) {
+			t_error = pthread_create(&tid[i], NULL, get_url, (void *)urls[i]);
+			if (0 != t_error) {
+				fprintf(stderr, "Couldn't run thread number %d, errno %d\n", i, t_error);
+			} else {
+				pthread_detach(tid[i]);
+			}
+		}
+*/
 		t_error = pthread_create(&tid[0], NULL, get_url, (void *)url);
 		if (0 != t_error) {
 			fprintf(stderr, "Couldn't run thread number %d, errno %d\n", 0, t_error);
@@ -239,6 +241,43 @@ int thermometer() {
 			//fprintf(stderr, "Thread %d, gets %s\n", 0, url);
 			pthread_detach(tid[0]);
 		}
+
+		t_error = pthread_create(&tid[1], NULL, put_rest_data, &put_args);
+		if (0 != t_error) {
+			fprintf(stderr, "Couldn't run thread number %d, errno %d\n", 0, t_error);
+		} else {
+			//fprintf(stderr, "Thread %d, gets %s\n", 0, url);
+			pthread_detach(tid[1]);
+		}
+
+	}
+	return(0);
+}
+
+int powersocket(char *buffer) {
+	pthread_t tid[1];
+	int t_error;
+	int rf12_node_id;
+	int rf12_seq;
+	int socket_group, socket_id, socket_state = 0;
+	static put_args_t put_args;
+
+// {"socket_state": [ "group": "8", "id": "1", "state": "1" ] };
+	if (sscanf(buffer, "Node ID: %d, seq: %d, data = {\"socket_state\": [ \"group\": \"%d\", \"id\": \"%d\", \"state\": \"%d\" ] };", &rf12_node_id, &rf12_seq, &socket_group, &socket_id, &socket_state) == 5) {
+
+		sprintf(put_args.url, "http://yavdr:8081/rest/items/Socket_%d_%d/state");
+		if (socket_state) {
+			put_args.state = "ON";
+		}
+
+		t_error = pthread_create(&tid[0], NULL, put_rest_data, &put_args);
+		if (0 != t_error) {
+			fprintf(stderr, "Couldn't run thread number %d, errno %d\n", 0, t_error);
+		} else {
+			//fprintf(stderr, "Thread %d, gets %s\n", 0, url);
+			pthread_detach(tid[0]);
+		}
+
 	}
 	return(0);
 }
@@ -254,159 +293,221 @@ void *read_stdin(void *null){
 			inChar = getc (stdin);
 			stdin_string[strIdx++] = inChar;
 			if ((inChar == '\n') || (inChar == '\r')) {
+				// write input string to serial port
+				fprintf(stderr, "READ_STDIN: writing stdin string to serial fd\n");
 				write(serial_fd, stdin_string, strIdx);
+				fprintf(stderr, "READ_STDIN: finished writing stdin string to serial fd\n");
+				fprintf(stderr, "READ_STDIN: clearing stdin string\n");
 				memset(&stdin_string[0], 0, sizeof(stdin_string));
 				strIdx = 0;
 			}
 		} else {
+			fprintf(stderr, "READ_STDIN: stdin string too long - clearing stdin string\n");
 			memset(&stdin_string[0], 0, sizeof(stdin_string));
 			strIdx = 0;
 		}
 	}
 }
 
-void *read_serial(void *null) {
-	open_serial_port();
-	while (1) {
-		/* read characters into our string buffer until we get a CR or NL */
-		bufptr = serial_buffer;
-		while ((nbytes = read(serial_fd, bufptr, serial_buffer + sizeof(serial_buffer) - bufptr - 1)) > 0) {
-			bufptr += nbytes;
-			if (bufptr[-1] == '\n' || bufptr[-1] == '\r') {
+void open_serial_port() {
+		struct termios tio;
 
-				int bufsize = bufptr - serial_buffer;
-				char http_data[bufsize];
-				strncpy(http_data, serial_buffer, bufsize -2);
-				
-				sprintf(page, "<html><body>%s</body></html>", http_data);
-				//fprintf(stderr, "bufsize: %d\tbufptr: %d\tserial_buffer: %d\t<html><body>%s</body></html>\n", bufsize, bufptr, serial_buffer, http_data);
+/* 
+		Open modem device for reading and writing and not as controlling tty
+		because we don't want to get killed if linenoise sends CTRL-C.
+*/
+	serial_fd = open(SERIAL_PORT, O_RDWR | O_NOCTTY ); 
+	if (serial_fd <0) {perror(SERIAL_PORT); exit(-1); }
 
-				fprintf(stderr, "%s", serial_buffer);
-				int rf12_hdr;
-				if (sscanf(serial_buffer, "hdr: 0x%x", &rf12_hdr) == 1) {
-					if (rf12_hdr == 0x25) {
-						powermeter();
-					} else if (rf12_hdr == 0x2d) {
-						thermometer();
-					//} else if (sscanf(serial_buffer, "Socket State:%c") == 1) {
-					////	thermometer();
+	bzero(&tio, sizeof(tio)); /* clear struct for new port settings */
+
+	tio.c_cflag = BAUDRATE | HUPCL | CS8 | CLOCAL | CREAD;
+	tio.c_iflag = IGNPAR;
+	tio.c_iflag &= ~( ICRNL  );
+	tio.c_oflag = 0;
+	tio.c_lflag = ICANON;
+	//tio.c_lflag &= ~( ICANON );
+	
+/* 
+		initialize all control characters 
+		default values can be found in /usr/include/termios.h, and are given
+		in the comments, but we don't need them here
+*/
+	tio.c_cc[VINTR]    = 0;     /* Ctrl-c */ 
+	tio.c_cc[VQUIT]    = 0;     /* Ctrl-\ */
+	tio.c_cc[VERASE]   = 0;     /* del */
+	tio.c_cc[VKILL]    = 0;     /* @ */
+	tio.c_cc[VEOF]     = 4;     /* Ctrl-d */
+	tio.c_cc[VTIME]    = 0;     /* inter-character timer unused */
+	tio.c_cc[VMIN]     = 1;     /* blocking read until 1 character arrives */
+	tio.c_cc[VSWTC]    = 0;     /* '\0' */
+	tio.c_cc[VSTART]   = 0;     /* Ctrl-q */ 
+	tio.c_cc[VSTOP]    = 0;     /* Ctrl-s */
+	tio.c_cc[VSUSP]    = 0;     /* Ctrl-z */
+	tio.c_cc[VEOL]     = 0;     /* '\0' */
+	tio.c_cc[VREPRINT] = 0;     /* Ctrl-r */
+	tio.c_cc[VDISCARD] = 0;     /* Ctrl-u */
+	tio.c_cc[VWERASE]  = 0;     /* Ctrl-w */
+	tio.c_cc[VLNEXT]   = 0;     /* Ctrl-v */
+	tio.c_cc[VEOL2]    = 0;     /* '\0' */
+
+		// now clean the modem line and activate the settings for the port
+	tcflush(serial_fd, TCIFLUSH);
+	tcsetattr(serial_fd,TCSANOW,&tio);
+}
+
+void *serial_read(void *null) {
+	int res;
+	char buf[256];
+	char http_string[256];
+	int rcvd_msgid;
+
+ while (1) {
+         /* read blocks program execution until a line terminating character is 
+            input, even if more than 255 chars are input. If the number
+            of characters read is smaller than the number of chars available,
+            subsequent reads will return the remaining chars. res will be set
+            to the actual number of characters actually read */
+		//fprintf(stderr, "SERIAL_READ: Beginning serial read\n");
+		res = read(serial_fd,buf,255); 
+		//fprintf(stderr, "SERIAL_READ: Finished serial read\n");
+		buf[res]=0;             /* set end of string, so we can printf */
+		//printf("DATA: %s\nSize:%d\n", buf, res);
+		if ((buf[res-1] == '\n') || (buf[res-1] == '\r')) {
+			//fprintf(stderr, "SERIAL_READ: Found Linebreak: %d\n", buf[res-1]);
+
+			fprintf(stderr, "SERIAL_READ: %s: %s", timestamp(), buf);
+
+				if (waiting_for_response == 1) {
+					if (sscanf(buf, "MSG ID: 0x%x: %[^;]", &rcvd_msgid, &http_string) == 2) {
+						if (rcvd_msgid == msgid) {
+							sprintf(page, "%s", http_string);
+							fprintf(stderr, "SERIAL_READ: wrote \"%s\" to html page\n", page);
+						} else {
+							sprintf(page, "<html><body></body></html>");
+							fprintf(stderr, "SERIAL_READ: msgid mismatch: 0x%x != 0x%x: wrote empty page\n", msgid, rcvd_msgid);
+						}
+						waiting_for_response = 0;
 					}
 				}
-				memset(&serial_buffer[0], 0, sizeof(serial_buffer));
-				memset(&http_data[0], 0, sizeof(http_data));
-				break;
+/*
+
+			if (num_strings < MAX_STRINGS) {
+				memset(&serial_strings[num_strings][0], 0, sizeof(serial_strings[num_strings]));
+				strncpy(serial_strings[num_strings++], buf, res);
+			} else {
+				num_strings = 0;
+			}
+*/
+			int rf12_node_id;
+			if (sscanf(buf, "Node ID: %d", &rf12_node_id) == 1) {
+				if (rf12_node_id == 5) {
+					powermeter(buf);
+				} else if (rf12_node_id == 6) {
+					thermometer(buf);
+				} else if (rf12_node_id == 8) {
+					powersocket(buf);
+				}
 			}
 		}
 	}
-	close(serial_fd);
-	return(0);
 }
 
-void *read_socket(void *null) {
-	portno = TCP_PORT;
-	socklen_t clilen;
-	char socket_buffer[256];
-	struct sockaddr_in serv_addr, cli_addr;
-	int n;
-	sockfd = socket(AF_INET, SOCK_STREAM, 0);
 
-	if (sockfd < 0) error("ERROR opening socket");
+int parse_get_args (void *cls, enum MHD_ValueKind kind, 
+                  const char *key, const char *value) {
+  printf ("PARSE_GET_ARGS: %s: %s\n", key, value);
 
-	bzero((char *) &serv_addr, sizeof(serv_addr));
-	serv_addr.sin_family = AF_INET;
-	serv_addr.sin_addr.s_addr = INADDR_ANY;
-	serv_addr.sin_port = htons(portno);
+		int strIdx;
+		char serial_string[256];
+		int sstring_size = snprintf(serial_string, 256, "MSG ID: 0x%04x: %s=%s\n", msgid, key, value);
 
-	if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) error("ERROR on binding");
+		int response_timeout = 2;
 
-	while (1) {
-		listen(sockfd,5);
-		clilen = sizeof(cli_addr);
-		newsockfd = accept(sockfd, 
-														(struct sockaddr *) &cli_addr, 
-														&clilen);
-		if (newsockfd < 0) error("ERROR on accept");
+		page_delivered = 0;
 
-		bzero(socket_buffer,256);
-		n = read(newsockfd,socket_buffer,255);
-		if (n < 0) error("ERROR reading from socket");
+		printf("PARSE_GET_ARGS: sending %s (size: %d) to the serial port\n", serial_string, sstring_size);
+		write(serial_fd, serial_string, sstring_size);
 
-		printf("Here is the message: %s, size: %d\n", socket_buffer, n);
-		//n = write(newsockfd, webpage, sizeof(webpage));
-
-		//if (socket_buffer[n-1] == '\n' || socket_buffer[n-1] == '\r') {
-			n = write(serial_fd, socket_buffer, n);
-		//}
-
-
-		if (n < 0) error("ERROR writing to socket");
-
-		close(newsockfd);
-	}
-	close(sockfd);
-	return 0; 
-}
-
-int print_out_key (void *cls, enum MHD_ValueKind kind, 
-                   const char *key, const char *value)
-{
-  printf ("%s: %s\n", key, value);
-  return MHD_YES;
+		printf("PARSE_GET_ARGS: waiting for response from avr\n");
+		waiting_for_response = 1;
+		while(strlen(page) <= 0) {
+			if (response_timeout-- <= 0) {
+				fprintf(stderr, "HTTP_CALLBACK: ERROR! No response from AVR after %d seconds\n", response_timeout);
+				avr_failure = 1;
+				return false;
+			}
+			sleep(1);
+		}
+		fprintf(stderr, "PARSE_GET_ARGS: Spent %d seconds waiting for response from avr\n", response_timeout);
+		msgid++;
 }
 
 int httpd_callback (void *cls, struct MHD_Connection *connection, 
-                          const char *url, 
-                          const char *method, const char *version, 
-                          const char *upload_data, 
-                          size_t *upload_data_size, void **con_cls)
-{
+																				const char *url, 
+																				const char *method, const char *version, 
+																				const char *upload_data, 
+																				size_t *upload_data_size, void **con_cls) {
 
 	struct MHD_Response *response;
-	int ret;
+	int ret, timeout;
 
-	printf ("New %s request for %s (length: %d) using version %s\n", method, url, sizeof(url), version);
-	//MHD_get_connection_values (connection, MHD_HEADER_KIND, &print_out_key, NULL);
-
-
-	if ((strncmp(url, "/\0", 2)  == 0) || (strncmp(url, "/index.html\0", 12) == 0)) {
-		fprintf(stderr, "INDEX!\n");
-		FILE *fp;
-		fp = fopen(INDEX_HTML, "r");
-		fclose(fp);
+	while(! page_delivered) {
+		if (avr_failure == 1) {
+			waiting_for_response = 0;
+			page_delivered = 1;
+			return MHD_NO;
+		}
+		printf("HTTPD_CALLBACK: Fucking waiting for page to be delivered\n");
+		sleep(1);
 	}
-	int strIdx;
-	char serial_string[255];
-	for (strIdx = 0; strIdx < 254 ; strIdx++){
-		if (url[strIdx] == '\0') {
-			serial_string[strIdx] = '\n';
-			break;
+
+	printf ("HTTPD_CALLBACK: Starting HTTP Callback for new %s request for %s using version %s\n", method, url, version);
+
+	memset(&page[0], 0, 65535);
+	if (! MHD_get_connection_values (connection, MHD_GET_ARGUMENT_KIND, &parse_get_args, NULL)) {
+		if (strncmp(url, "/\0", 2) == 0) {
+			url = "/index.html";
+		}
+
+		char httpd_file_path[256] = HTTPD_ROOT;
+		strncat(httpd_file_path, url, 256);
+		
+
+		struct stat sb;
+		if (stat(httpd_file_path, &sb) == -1) {
+			fprintf(stderr, "HTTPD_CALLBACK: stat error: %s\n", httpd_file_path);
+			return MHD_NO;
+		}
+		
+		if ((sb.st_mode & S_IFMT) == S_IFREG) {
+			fprintf(stderr, "HTTPD_CALLBACK: delivering %s\n", httpd_file_path);
+			int pageIdx = 0;
+			char inChar;
+			FILE *fp;
+			fp = fopen(httpd_file_path, "r");
+			while (inChar != EOF) {
+				inChar = fgetc(fp);
+				if (inChar != EOF) {
+					page[pageIdx++] = inChar;
+				}
+			}
+			fclose(fp);
 		} else {
-			serial_string[strIdx] = url[strIdx];
+			// 404
+			fprintf(stderr, "HTTPD_CALLBACK: not a regular file: %s 0x%x != 0x%x\n", httpd_file_path, sb.st_mode & S_IFMT, S_IFREG);
+			return MHD_NO;
 		}
 	}
 
-	printf("url index: %d\n", strIdx);
-	if (strncmp(serial_string, "/favicon.ico", 12) != 0) { // requests for /favicon.ico are ignored
-		write(serial_fd, serial_string, strIdx + 1);
-	}
+	printf("HTTPD_CALLBACK: delivering page\n");
 
-	int response_timer = 0;
-	memset(&page[0], 0, sizeof(page));
-	while(strlen(page) <= 0) {
-		//printf("waiting for response\n");
-		sleep(1);
-		response_timer++;
-	}
-	fprintf(stderr, "Spent %dms waiting for response\n", response_timer);
-	
 	response = MHD_create_response_from_data(strlen(page), (void*)page, 0, 0);
  ret = MHD_queue_response (connection, MHD_HTTP_OK, response);
 	MHD_destroy_response (response);
 
+	page_delivered = 1;
 	return ret;
-
-
-	//return MHD_NO;
 }
 
 
@@ -423,10 +524,11 @@ int main(void) {
 	// Register signal and signal handler
 	signal(SIGINT, signal_callback_handler);
 
+	open_serial_port();
 	kill_power_led();
 
 	// start serial listener
-	t_error = pthread_create(&tid[0], NULL, read_serial, NULL);
+	t_error = pthread_create(&tid[0], NULL, serial_read, NULL);
 	fprintf(stderr, "Starting serial read thread\n");
 	if (0 != t_error) 
 		fprintf(stderr, "Couldn't run thread number %d, errno %d\n", 0, t_error);
@@ -439,7 +541,8 @@ int main(void) {
 
 	// start http daemon
 	fprintf(stderr, "Starting httpd daemon\n");
-	daemon = MHD_start_daemon (MHD_USE_SELECT_INTERNALLY, HTTPD_PORT, NULL, NULL, 
+	//daemon = MHD_start_daemon (MHD_USE_SELECT_INTERNALLY, HTTPD_PORT, NULL, NULL, 
+	daemon = MHD_start_daemon (MHD_USE_THREAD_PER_CONNECTION, HTTPD_PORT, NULL, NULL, 
                              &httpd_callback, NULL, MHD_OPTION_END);
 	if (NULL == daemon) error("ERROR starting httpd");
 
@@ -452,99 +555,4 @@ int main(void) {
 	return 0;
 }
 
-
-/*
-// configuration, as stored in EEPROM
-struct Config {
-  uint8_t band;
-  uint8_t group;
-  uint8_t collect;
-  uint16_t port;
-  uint8_t valid; // keep this as last byte
-} config;
-
-// ethernet interface mac address - must be unique on your network
-static uint8_t mymac[] = { 0x74,0x69,0x69,0x2D,0x30,0x31 };
-
-// buffer for an outgoing data packet
-//static uint8_t outBuf[RF12_MAXDATA], outDest;
-static uint8_t outCount = -1;
-
-// this buffer will be used to construct a collectd UDP packet
-static uint8_t collBuf [200], collPos;
-
-#define NUM_MESSAGES  3     // Number of messages saved in history
-#define MESSAGE_TRUNC 15    // Truncate message payload to reduce memory use
-
-//static BufferFiller bfill;  // used as cursor while filling the buffer
-
-static uint8_t history_rcvd[NUM_MESSAGES][MESSAGE_TRUNC+1]; //history record
-static uint8_t history_len[NUM_MESSAGES]; // # of RF12 messages+header in history
-static uint8_t next_msg;       // pointer to next rf12rcvd line
-static uint16_t msgs_rcvd;      // total number of lines received modulo 10,000
-
-// byte Ethernet::buffer[700];   // tcp/ip send and receive buffer
-
-static void loadConfig () {
-    config.valid = 253;
-    config.band = 8;
-    config.group = 1;
-    config.collect = 1;
-    config.port = 25827;
-  uint8_t freq = config.band == 4 ? RF12_433MHZ :
-              config.band == 8 ? RF12_868MHZ :
-                                 RF12_915MHZ;
-}
-
-
-
-static void collectTypeLen (uint16_t type, uint16_t len) {
-  len += 4;
-  collBuf[collPos++] = type >> 8;
-  collBuf[collPos++] = (uint8_t) type;
-  collBuf[collPos++] = len >> 8;
-  collBuf[collPos++] = (uint8_t) len;
-}
-
-static void collectStr (uint16_t type, const uint8_t* data) {
-  uint16_t len = strlen(data) + 1;
-  collectTypeLen(type, len);
-  strcpy((uint8_t*) collBuf + collPos, data);
-  collPos += len;
-}
-
-static void collectPayload (uint16_t type) {
-  // Copy the received RF12 data into a as many values as needed.
-  uint8_t num = rf12_len / 8 + 1; // this many values will be needed
-  collectTypeLen(type, 2 + 9 * num);
-  collBuf[collPos++] = 0;
-  collBuf[collPos++] = num;
-  for (uint8_t i = 0; i < num; ++i)
-    collBuf[collPos++] = 0; // counter
-  for (uint8_t i = 0; i < 8 * num; ++i) // include -1, i.e. the length byte
-    collBuf[collPos++] = i <= rf12_len ? rf12_data[i-1] : 0;
-}
-
-static void forwardToUDP () {
-  static uint8_t destIp[] = { 239,192,74,66 }; // UDP multicast address
-  uint8_t buf[10];
-  
-  collPos = 0;
-  collectStr(0x0000, "JeeUdp");
-  collectStr(0x0002, "RF12");
-  uint16_t mhz = config.band == 4 ? 433 : config.band == 8 ? 868 : 915;
-  sprintf(buf, "%d.%d", mhz, config.group);
-  collectStr(0x0003, buf);
-  collectStr(0x0004, "OK");
-  sprintf(buf, "%d", rf12_hdr);
-  collectStr(0x0005, buf);
-  collectPayload(0x0006);
-  
-  ether.sendUdp ((uint8_t*) collBuf, collPos, 23456, destIp, config.port);
-#if SERIAL
-  Serial.println("UDP sent");
-#endif
-}
-
-*/
 

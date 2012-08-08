@@ -13,6 +13,8 @@ PKG_RELEASE:=1
 PKG_BUILD_DIR := $(BUILD_DIR)/$(PKG_NAME)
 
 include $(INCLUDE_DIR)/package.mk
+TARGET_CFLAGS +=-I$(STAGING_DIR)/usr/include
+TARGET_LDFLAGS += -Wl,-rpath-link=$(STAGING_DIR)/usr/lib,-rpath-link=$(STAGING_DIR)/root-brcm47xx/lib
 
 define Package/ahans
   SECTION:=utils
@@ -37,12 +39,12 @@ define Build/Compile
 	$(MAKE) -C $(PKG_BUILD_DIR) \
 		CC="$(TARGET_CC)" \
 		CFLAGS="$(TARGET_CFLAGS) -Wall" \
-		LDFLAGS="$(TARGET_LDFLAGS) -L$(STAGING_DIR)/root-brcm47xx/usr/lib -lcurl -lpthread -lmicrohttpd -lstdc++"
+		LDFLAGS="$(TARGET_LDFLAGS) -lcurl -lpthread -lmicrohttpd -lstdc++"
 endef
 
 define Package/ahans/install
-	$(INSTALL_DIR) $(1)/usr/sbin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ahans $(1)/usr/sbin/
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ahans $(1)/usr/bin/
 endef
 
 $(eval $(call BuildPackage,ahans))
